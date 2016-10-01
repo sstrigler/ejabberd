@@ -3860,8 +3860,9 @@ get_configure_xfields(_Type, Options, Lang, Groups) ->
 	     {collection,
           ?NLIST_CONFIG_FIELD(<<"The collections with which a node is affiliated">>,
                               collection)},
-         ?ALIST_CONFIG_FIELD(<<"Whether owners or publisher should receive replies to items">>,
-                             itemreply, [none, owner, publisher])],
+         {itemreply,
+          ?ALIST_CONFIG_FIELD(<<"Whether owners or publisher should receive replies to items">>,
+                             itemreply, [none, owner, publisher])},
          {secret,
           ?STRING_CONFIG_FIELD(<<"A secret token for publisher authorization">>,
               secret)}]).
