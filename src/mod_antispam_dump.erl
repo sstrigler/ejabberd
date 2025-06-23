@@ -65,8 +65,7 @@ init_dumping(Host) ->
 terminate_dumping(_Host, false) ->
     ok;
 terminate_dumping(Host, Fd) ->
-    DumpFile1 = get_path_option(Host),
-    close_dump_file(Fd, DumpFile1),
+    close_dump_file(Fd),
     ejabberd_hooks:delete(spam_stanza_rejected, Host, ?MODULE, dump_spam_stanza, 50),
     case gen_mod:is_loaded_elsewhere(Host, ?MODULE) of
         false ->
@@ -79,14 +78,14 @@ reload_dumping(Host, Fd, OldOpts, NewOpts) ->
     case {get_path_option(Host, OldOpts), get_path_option(Host, NewOpts)} of
         {Old, Old} ->
             Fd;
-        {Old, New} ->
-            reopen_dump_file(Fd, Old, New)
+        {_Old, New} ->
+            reopen_dump_file2(Fd, New)
     end.
 
 -spec reopen_dump_file(binary(), file:io_device()) -> file:io_device().
 reopen_dump_file(Host, Fd) ->
     DumpFile1 = get_path_option(Host),
-    reopen_dump_file(Fd, DumpFile1, DumpFile1).
+    reopen_dump_file2(Fd, DumpFile1).
 
 %%--------------------------------------------------------------------
 %%| Hook callbacks
@@ -126,20 +125,20 @@ open_dump_file(Name) ->
             undefined
     end.
 
--spec close_dump_file(undefined | file:io_device(), filename()) -> ok.
-close_dump_file(undefined, false) ->
+-spec close_dump_file(undefined | file:io_device()) -> ok.
+close_dump_file(undefined) ->
     ok;
-close_dump_file(Fd, Name) ->
+close_dump_file(Fd) ->
     case file:close(Fd) of
         ok ->
-            ?DEBUG("Closed ~s", [Name]);
+            ?DEBUG("Closed ~p", [Fd]);
         {error, Reason} ->
-            ?ERROR_MSG("Cannot close ~s: ~s", [Name, file:format_error(Reason)])
+            ?ERROR_MSG("Cannot close ~p: ~s", [Fd, file:format_error(Reason)])
     end.
 
--spec reopen_dump_file(file:io_device(), binary(), binary()) -> file:io_device().
-reopen_dump_file(Fd, OldDumpFile, NewDumpFile) ->
-    close_dump_file(Fd, OldDumpFile),
+-spec reopen_dump_file2(file:io_device(), binary()) -> file:io_device().
+reopen_dump_file2(Fd, NewDumpFile) ->
+    close_dump_file(Fd),
     open_dump_file(NewDumpFile).
 
 write_stanza_dump(Fd, XML) ->
