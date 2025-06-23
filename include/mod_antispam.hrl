@@ -24,3 +24,24 @@
 -type filename() :: binary() | none | false.
 -type jid_set() :: sets:set(ljid()).
 -type url_set() :: sets:set(url()).
+
+-record(rtbl_service,
+        {host = none                  :: binary() | none,
+         node                         :: binary() | none,
+         subscribed = false           :: boolean(),
+         retry_timer = undefined      :: reference() | undefined}).
+
+-type rtbl_service() :: #rtbl_service{}.
+
+-record(antispam_state,
+        {host = <<>> :: binary(),
+         dump_fd = undefined          :: file:io_device() | undefined,
+         url_set = sets:new()         :: url_set(),
+         jid_set = sets:new()         :: jid_set(),
+         jid_cache = #{}              :: map(),
+         max_cache_size = 0           :: non_neg_integer() | unlimited,
+         rtbl_services = []           :: [rtbl_service()],
+         blocked_domains = #{}        :: #{binary() => any()},
+         whitelist_domains = #{}      :: #{binary() => false}}).
+
+-type antispam_state() :: #antispam_state{}.

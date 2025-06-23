@@ -32,15 +32,18 @@
 -author('holger@zedat.fu-berlin.de').
 -author('stefan@strigler.de').
 
--export([init_filtering/1, terminate_filtering/1]).
+-export([init_filtering/1, terminate_filtering/1, notify_rooms/2, sha256/1]).
 %% ejabberd_hooks callbacks
 -export([s2s_in_handle_info/2, s2s_receive_packet/1, sm_receive_packet/1]).
+%% ejabberd_hooks muc callbacks
+-export([muc_presence_filter/3, muc_process_iq/2]).
+
+-include_lib("xmpp/include/xmpp.hrl").
 
 -include("logger.hrl").
 -include("translate.hrl").
 -include("mod_antispam.hrl").
-
--include_lib("xmpp/include/xmpp.hrl").
+-include("mod_muc_room.hrl").
 
 -type s2s_in_state() :: ejabberd_s2s_in:state().
 
@@ -50,11 +53,15 @@
 %%| Exported
 
 init_filtering(Host) ->
+    ejabberd_hooks:add(muc_filter_presence, Host, ?MODULE, muc_presence_filter, 50),
+    ejabberd_hooks:add(muc_process_iq, Host, ?MODULE, muc_process_iq, 50),
     ejabberd_hooks:add(s2s_in_handle_info, Host, ?MODULE, s2s_in_handle_info, 90),
     ejabberd_hooks:add(s2s_receive_packet, Host, ?MODULE, s2s_receive_packet, 50),
     ejabberd_hooks:add(sm_receive_packet, Host, ?MODULE, sm_receive_packet, 50).
 
 terminate_filtering(Host) ->
+    ejabberd_hooks:delete(muc_filter_presence, Host, ?MODULE, muc_presence_filter, 50),
+    ejabberd_hooks:delete(muc_process_iq, Host, ?MODULE, muc_process_iq, 50),
     ejabberd_hooks:delete(s2s_receive_packet, Host, ?MODULE, s2s_receive_packet, 50),
     ejabberd_hooks:delete(sm_receive_packet, Host, ?MODULE, sm_receive_packet, 50),
     ejabberd_hooks:delete(s2s_in_handle_info, Host, ?MODULE, s2s_in_handle_info, 90).
@@ -90,10 +97,69 @@ sm_receive_packet(Acc) ->
     Acc.
 
 %%--------------------------------------------------------------------
+%%| Hook MUC callbacks
+
+%% Code copied from mod_muc_rtbl.erl
+
+muc_presence_filter(#presence{from = From, to = #jid{lserver = MucService} = To} = Msg,
+                    _State,
+                    _Nick) ->
+    HostOfMucService = ejabberd_router:host_of_route(MucService),
+    do_check(From, To, HostOfMucService, Msg).
+
+notify_rooms(Host, Items) ->
+    IQ = #iq{type = set,
+             to = jid:make(Host),
+             sub_els = [{rtbl_update, Items}]},
+    lists:foreach(fun(CHost) ->
+                     OnlineRooms = mod_muc:get_online_rooms(CHost),
+                     lists:foreach(fun ({_, _, Pid}) when node(Pid) == node() ->
+                                           mod_muc_room:route(Pid, IQ);
+                                       (_) ->
+                                           ok
+                                   end,
+                                   OnlineRooms)
+                  end,
+                  mod_muc_admin:find_hosts(Host)).
+
+muc_process_iq(#iq{type = set, sub_els = [{rtbl_update, _Items}]},
+               #state{users = Users} = State0) ->
+    NewState =
+        maps:fold(fun (_, #user{role = moderator}, State) ->
+                          State;
+                      (_, #user{jid = JID, last_presence = LastPresence}, State) ->
+                          case do_check(JID, State#state.jid, State#state.server_host, LastPresence)
+                          of
+                              {stop, drop} ->
+                                  {_, _, State2} =
+                                      mod_muc_room:handle_event({process_item_change,
+                                                                 {JID,
+                                                                  role,
+                                                                  none,
+                                                                  <<"Banned by RTBL">>},
+                                                                 undefined},
+                                                                normal_state,
+                                                                State),
+                                  State2;
+                              _ ->
+                                  State
+                          end
+                  end,
+                  State0,
+                  Users),
+    {stop, {ignore, NewState}};
+muc_process_iq(IQ, _State) ->
+    IQ.
+
+sha256(Data) ->
+    Bin = crypto:hash(sha256, Data),
+    str:to_hexlist(Bin).
+
+%%--------------------------------------------------------------------
 %%| Filtering deciding
 
 do_check(From, To, LServer, Stanza) ->
-    case needs_checking(From, To) of
+    case needs_checking(From, To, LServer) of
         true ->
             case check_from(LServer, From) of
                 ham ->
@@ -125,12 +191,12 @@ s2s_in_handle_info(State, {_Ref, {spam_filter, _}}) ->
 s2s_in_handle_info(State, _) ->
     State.
 
--spec needs_checking(jid(), jid()) -> boolean().
-needs_checking(#jid{lserver = FromHost} = From, #jid{lserver = LServer} = To) ->
-    case gen_mod:is_loaded(LServer, ?MODULE_ANTISPAM) of
+-spec needs_checking(jid(), jid(), binary()) -> boolean().
+needs_checking(#jid{lserver = FromHost} = From, To, DestinationHost) ->
+    case gen_mod:is_loaded(DestinationHost, ?MODULE_ANTISPAM) of
         true ->
-            Access = gen_mod:get_module_opt(LServer, ?MODULE_ANTISPAM, access_spam),
-            case acl:match_rule(LServer, Access, To) of
+            Access = gen_mod:get_module_opt(DestinationHost, ?MODULE_ANTISPAM, access_spam),
+            case acl:match_rule(DestinationHost, Access, To) of
                 allow ->
                     ?DEBUG("Spam not filtered for ~s", [jid:encode(To)]),
                     false;
@@ -143,7 +209,7 @@ needs_checking(#jid{lserver = FromHost} = From, #jid{lserver = LServer} = To) ->
                                     To) % likely a gateway
             end;
         false ->
-            ?DEBUG("~s not loaded for ~s", [?MODULE_ANTISPAM, LServer]),
+            ?DEBUG("~s not loaded for ~s", [?MODULE_ANTISPAM, DestinationHost]),
             false
     end.
 
@@ -161,7 +227,7 @@ check_from(Host, From) ->
                 ejabberd_hooks:run(spam_found, Host, [{jid, From}]),
                 spam;
             false ->
-                case gen_server:call(Proc, {check_jid, LFrom}) of
+                case gen_server:call(Proc, {check_from, LFrom}) of
                     {spam_filter, Result} ->
                         Result
                 end
@@ -185,8 +251,12 @@ check_body(Host, From, Body) ->
                 jid:remove_resource(
                     jid:tolower(From)),
             try gen_server:call(Proc, {check_body, URLs, JIDs, LFrom}) of
-                {spam_filter, Result} ->
-                    Result
+                {spam_filter, spam} ->
+                    ?DEBUG("Found spam in body: ~p", [Body]),
+                    ejabberd_hooks:run(spam_found, Host, [{body, Body}]),
+                    spam;
+                {spam_filter, ham} ->
+                    ham
             catch
                 exit:{timeout, _} ->
                     ?WARNING_MSG("Timeout while checking body", []),

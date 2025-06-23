@@ -37,11 +37,11 @@
 %% ejabberd_hooks callbacks
 -export([dump_spam_stanza/1, reopen_log/0]).
 
+-include_lib("xmpp/include/xmpp.hrl").
+
 -include("logger.hrl").
 -include("mod_antispam.hrl").
 -include("translate.hrl").
-
--include_lib("xmpp/include/xmpp.hrl").
 
 %%--------------------------------------------------------------------
 %%| Exported

@@ -61,32 +61,13 @@
 	 reload_spam_filter_files/1,
 	 remove_blocked_domain/2]).
 
+-include_lib("xmpp/include/xmpp.hrl").
 -include("ejabberd_commands.hrl").
 -include("logger.hrl").
 -include("mod_antispam.hrl").
 -include("translate.hrl").
 
--include_lib("xmpp/include/xmpp.hrl").
-
--record(state,
-	{host = <<>>			:: binary(),
-	 dump_fd = undefined		:: file:io_device() | undefined,
-	 url_set = sets:new()		:: url_set(),
-	 jid_set = sets:new()		:: jid_set(),
-	 jid_cache = #{}		:: map(),
-	 max_cache_size = 0		:: non_neg_integer() | unlimited,
-	 rtbl_host = none		:: binary() | none,
-	 rtbl_subscribed = false	:: boolean(),
-	 rtbl_retry_timer = undefined	:: reference() | undefined,
-	 rtbl_domains_node		:: binary(),
-	 blocked_domains = #{}		:: #{binary() => any()},
-	 whitelist_domains = #{}	:: #{binary() => false}
-	}).
-
--type state() :: #state{}.
-
 -define(COMMAND_TIMEOUT, timer:seconds(30)).
--define(DEFAULT_RTBL_DOMAINS_NODE, <<"spam_source_domains">>).
 -define(DEFAULT_CACHE_SIZE, 10000).
 
 %% @format-begin
@@ -118,7 +99,7 @@ stop(Host) ->
 reload(Host, NewOpts, OldOpts) ->
     ?DEBUG("reloading", []),
     Proc = get_proc_name(Host),
-    gen_server:cast(Proc, {reload, NewOpts, OldOpts}).
+    gen_server:cast(Proc, {reload_module, NewOpts, OldOpts}).
 
 -spec depends(binary(), gen_mod:opts()) -> [{module(), hard | soft}].
 depends(_Host, _Opts) ->
@@ -129,12 +110,14 @@ mod_opt_type(access_spam) ->
     econf:acl();
 mod_opt_type(cache_size) ->
     econf:pos_int(unlimited);
-mod_opt_type(rtbl_host) ->
-    econf:either(
-        econf:enum([none]), econf:host());
-mod_opt_type(rtbl_domains_node) ->
-    econf:non_empty(
-        econf:binary());
+mod_opt_type(rtbl_services) ->
+    econf:list(
+        econf:and_then(
+            econf:options(#{host => econf:binary(), node => econf:binary()}),
+            fun(Opts) ->
+               #rtbl_service{host = proplists:get_value(host, Opts, <<>>),
+                             node = proplists:get_value(node, Opts, <<>>)}
+            end));
 mod_opt_type(spam_domains_file) ->
     econf:either(
         econf:enum([none]), econf:file());
@@ -151,12 +134,14 @@ mod_opt_type(whitelist_domains_file) ->
     econf:either(
         econf:enum([none]), econf:file()).
 
--spec mod_options(binary()) -> [{atom(), any()}].
+-spec mod_options(binary()) -> [{rtbl_services, [tuple()]} | {atom(), any()}].
 mod_options(_Host) ->
+    DefaultRtblServices =
+        [#rtbl_service{host = <<"xmppbl.org">>, node = <<"muc_bans_sha256">>},
+         #rtbl_service{host = <<"xmppbl.org">>, node = <<"spam_source_domains">>}],
     [{access_spam, none},
      {cache_size, ?DEFAULT_CACHE_SIZE},
-     {rtbl_domains_node, ?DEFAULT_RTBL_DOMAINS_NODE},
-     {rtbl_host, none},
+     {rtbl_services, DefaultRtblServices},
      {spam_domains_file, none},
      {spam_dump_file, false},
      {spam_jids_file, none},
@@ -164,7 +149,13 @@ mod_options(_Host) ->
      {whitelist_domains_file, none}].
 
 mod_doc() ->
-    #{desc => ?T("Reads from text file and RTBL, filters stanzas and writes dump file."),
+    #{desc =>
+          ?T("Filter spam messages and subscription requests received from "
+             "remote servers based on Real-Time Block Lists (RTBL), lists of known "
+             "spammer JIDs and/or URLs mentioned in spam messages. "
+             "Traffic classified as spam is rejected with an error "
+             "(and an '[info]' message is logged) unless the sender "
+             "is subscribed to the recipient's presence."),
       note => "added in 25.xx",
       opts =>
           [{access_spam,
@@ -175,6 +166,37 @@ mod_doc() ->
                      "spam messages aren't rejected for that recipient. "
                      "The default value is 'none', which means that all recipients "
                      "are subject to spam filtering verification.")}},
+           {cache_size,
+            #{value => "pos_integer()",
+              desc =>
+                  ?T("Maximum number of JIDs that will be cached due to sending spam URLs. "
+                     "If that limit is exceeded, the least recently used "
+                     "entries are removed from the cache. "
+                     "Setting this option to '0' disables the caching feature. "
+                     "Note that separate caches are used for each virtual host, "
+                     " and that the caches aren't distributed across cluster nodes. "
+                     "The default value is '10000'.")}},
+           {rtbl_services,
+            #{value => ?T("[Service, ...]"),
+              example =>
+                  ["rtbl_services:",
+                   "  -",
+                   "    host: pubsub.server1.localhost",
+                   "    node: spam1_source_domains",
+                   "  -",
+                   "    host: pubsub.server1.localhost",
+                   "    node: muc_bans_sha256",
+                   "  -",
+                   "    host: pubsub.server2.localhost",
+                   "    node: spam2_source_domains"],
+              desc =>
+                  ?T("List of RTBL services to subscribe and obtain list of domains to block. "
+                     "The default value is to use both PubSub nodes provided "
+                     "by https://xmppbl.org/[xmppbl.org]. "
+                     "Each 'Service' element in the list is constructed using the following options: ")},
+            [{host,
+              #{value => "string()", desc => ?T("Remote host with a PubSub service to query.")}},
+             {node, #{value => "string()", desc => ?T("PubSub node to query.")}}]},
            {spam_domains_file,
             #{value => ?T("none | Path"),
               desc =>
@@ -189,9 +211,11 @@ mod_doc() ->
             #{value => ?T("false | true | Path"),
               desc =>
                   ?T("Path to the file to store blocked messages. "
-                     "Use an absolute path, or the '@LOG_PATH@' macro to store logs "
+                     "Use an absolute path, or the '@LOG_PATH@' "
+                     "https://docs.ejabberd.im/admin/configuration/file-format/#predefined-keywords[predefined keyword] "
+                     "to store logs "
                      "in the same place that the other ejabberd log files. "
-                     "If set to 'false', does not dump stanzas, this is the default. "
+                     "If set to 'false', it doesn't dump stanzas, which is the default. "
                      "If set to 'true', it stores in '\"@LOG_PATH@/spam_dump_@HOST@.log\"'.")}},
            {spam_jids_file,
             #{value => ?T("none | Path"),
@@ -220,56 +244,56 @@ mod_doc() ->
                   ?T("Path to a file containing a list of "
                      "domains to whitelist from being blocked, one per line. "
                      "If either it is in 'spam_domains_file' or more realistically "
-                     "in a domain sent by a RTBL host (see option 'rtbl_host') "
+                     "in a domain sent by a RTBL host (see option 'rtbl_services') "
                      "then this domain will be ignored and stanzas from there won't be blocked. "
                      "The default value is 'none'.")}}],
       example =>
           ["modules:",
            "  mod_antispam:",
-           "    spam_dump_file: \"@LOG_PATH@/spam/host-@HOST@.log\""]}.
+           "    spam_dump_file: \"@LOG_PATH@/spam/host-@HOST@.log\"",
+           "    spam_jids_file: \"@CONFIG_PATH@/spam_jids.txt\"",
+           "    rtbl_services:",
+           "      -",
+           "        host: xmppbl.org",
+           "        node: muc_bans_sha256"]}.
 
 %%--------------------------------------------------------------------
-%%| gen_server callbacks
+%%| gen_server: init
 
--spec init(list()) -> {ok, state()} | {stop, term()}.
+-spec init(list()) -> {ok, antispam_state()} | {stop, term()}.
 init([Host, Opts]) ->
     process_flag(trap_exit, true),
+    RtblServices = gen_mod:get_opt(rtbl_services, Opts),
     mod_antispam_files:init_files(Host),
-    FilesResults = read_files(Host),
+    mod_antispam_filter:init_filtering(Host),
+    mod_antispam_rtbl:add_hook(Host),
+    mod_antispam_rtbl:request_blocked_domains(RtblServices, Host),
     #{jid := JIDsSet,
       url := URLsSet,
       domains := SpamDomainsSet,
       whitelist_domains := WhitelistDomains} =
-        FilesResults,
-    ejabberd_hooks:add(local_send_to_resource_hook,
-                       Host,
-                       mod_antispam_rtbl,
-                       pubsub_event_handler,
-                       50),
-    RTBLHost = gen_mod:get_opt(rtbl_host, Opts),
-    RTBLDomainsNode = gen_mod:get_opt(rtbl_domains_node, Opts),
-    mod_antispam_filter:init_filtering(Host),
+        read_files(Host),
     InitState =
-        #state{host = Host,
-               jid_set = JIDsSet,
-               url_set = URLsSet,
-               dump_fd = mod_antispam_dump:init_dumping(Host),
-               max_cache_size = gen_mod:get_opt(cache_size, Opts),
-               blocked_domains = set_to_map(SpamDomainsSet),
-               whitelist_domains = set_to_map(WhitelistDomains, false),
-               rtbl_host = RTBLHost,
-               rtbl_domains_node = RTBLDomainsNode},
-    mod_antispam_rtbl:request_blocked_domains(RTBLHost, RTBLDomainsNode, Host),
-    {ok, InitState}.
+        #antispam_state{host = Host,
+                        jid_set = JIDsSet,
+                        url_set = URLsSet,
+                        dump_fd = mod_antispam_dump:init_dumping(Host),
+                        max_cache_size = gen_mod:get_opt(cache_size, Opts),
+                        whitelist_domains = set_to_map(WhitelistDomains, false),
+                        rtbl_services = RtblServices},
+    {ok, update_blocked_domains_state({add, set_to_map(SpamDomainsSet)}, InitState)}.
 
--spec handle_call(term(), {pid(), term()}, state()) ->
-                     {reply, {spam_filter, term()}, state()} | {noreply, state()}.
-handle_call({check_jid, From}, _From, #state{jid_set = JIDsSet} = State) ->
-    {Result, State1} = filter_jid(From, JIDsSet, State),
+%%--------------------------------------------------------------------
+%%| gen_server: handle_call
+
+-spec handle_call(term(), {pid(), term()}, antispam_state()) ->
+                     {reply, {spam_filter, term()}, antispam_state()} | {noreply, antispam_state()}.
+handle_call({check_from, From}, _From, #antispam_state{jid_set = JIDsSet} = State) ->
+    {Result, State1} = filter_from(From, JIDsSet, State),
     {reply, {spam_filter, Result}, State1};
 handle_call({check_body, URLs, JIDs, From},
             _From,
-            #state{url_set = URLsSet, jid_set = JIDsSet} = State) ->
+            #antispam_state{url_set = URLsSet, jid_set = JIDsSet} = State) ->
     {Result1, State1} = filter_body(URLs, URLsSet, From, State),
     {Result2, State2} = filter_body(JIDs, JIDsSet, From, State1),
     Result =
@@ -291,175 +315,141 @@ handle_call({add_to_cache, JID}, _From, State) ->
 handle_call({drop_from_cache, JID}, _From, State) ->
     {Result, State1} = drop_from_cache(JID, State),
     {reply, {spam_filter, Result}, State1};
-handle_call(get_cache, _From, #state{jid_cache = Cache} = State) ->
+handle_call(get_cache, _From, #antispam_state{jid_cache = Cache} = State) ->
     {reply, {spam_filter, maps:to_list(Cache)}, State};
-handle_call({add_blocked_domain, Domain},
-            _From,
-            #state{blocked_domains = BlockedDomains} = State) ->
-    BlockedDomains1 = maps:merge(BlockedDomains, #{Domain => true}),
+handle_call({add_blocked_domain, Domain}, _From, State) ->
     Txt = format("~s added to blocked domains", [Domain]),
-    {reply, {spam_filter, {ok, Txt}}, State#state{blocked_domains = BlockedDomains1}};
-handle_call({remove_blocked_domain, Domain},
-            _From,
-            #state{blocked_domains = BlockedDomains} = State) ->
-    BlockedDomains1 = maps:remove(Domain, BlockedDomains),
+    {reply,
+     {spam_filter, {ok, Txt}},
+     update_blocked_domains_state({add, #{Domain => true}}, State)};
+handle_call({remove_blocked_domain, Domain}, _From, State) ->
     Txt = format("~s removed from blocked domains", [Domain]),
-    {reply, {spam_filter, {ok, Txt}}, State#state{blocked_domains = BlockedDomains1}};
+    {reply, {spam_filter, {ok, Txt}}, update_blocked_domains_state({remove, Domain}, State)};
 handle_call(get_blocked_domains,
             _From,
-            #state{blocked_domains = BlockedDomains, whitelist_domains = WhitelistDomains} =
+            #antispam_state{blocked_domains = BlockedDomains,
+                            whitelist_domains = WhitelistDomains} =
                 State) ->
     {reply, {blocked_domains, maps:merge(BlockedDomains, WhitelistDomains)}, State};
 handle_call({is_blocked_domain, Domain},
             _From,
-            #state{blocked_domains = BlockedDomains, whitelist_domains = WhitelistDomains} =
+            #antispam_state{blocked_domains = BlockedDomains,
+                            whitelist_domains = WhitelistDomains} =
                 State) ->
-    {reply,
-     maps:get(Domain, maps:merge(BlockedDomains, WhitelistDomains), false) =/= false,
-     State};
+    Domains = maps:merge(BlockedDomains, WhitelistDomains),
+    Result =
+        case maps:get(Domain, Domains, false) of
+            false ->
+                %DomainSha = mod_antispam_filter:sha256(jid:encode(jid:tolower(jid:remove_resource(Domain)))),
+                DomainSha = mod_antispam_filter:sha256(Domain),
+                maps:get(DomainSha, Domains, false);
+            true ->
+                true
+        end,
+    {reply, Result, State};
 handle_call(Request, From, State) ->
     ?ERROR_MSG("Got unexpected request from ~p: ~p", [From, Request]),
     {noreply, State}.
 
--spec handle_cast(term(), state()) -> {noreply, state()}.
-handle_cast({dump_stanza, XML}, #state{dump_fd = Fd} = State) ->
+%%--------------------------------------------------------------------
+%%| gen_server: handle_cast
+
+-spec handle_cast(term(), antispam_state()) -> {noreply, antispam_state()}.
+handle_cast({dump_stanza, XML}, #antispam_state{dump_fd = Fd} = State) ->
     mod_antispam_dump:write_stanza_dump(Fd, XML),
     {noreply, State};
-handle_cast(reopen_log, #state{host = Host, dump_fd = Fd} = State) ->
-    {noreply, State#state{dump_fd = mod_antispam_dump:reopen_dump_file(Host, Fd)}};
-handle_cast({reload, NewOpts, OldOpts},
-            #state{host = Host,
-                   dump_fd = Fd,
-                   rtbl_host = OldRTBLHost,
-                   rtbl_domains_node = OldRTBLDomainsNode,
-                   rtbl_retry_timer = RTBLRetryTimer} =
-                State) ->
-    misc:cancel_timer(RTBLRetryTimer),
+handle_cast(reopen_log, #antispam_state{host = Host, dump_fd = Fd} = State) ->
+    {noreply, State#antispam_state{dump_fd = mod_antispam_dump:reopen_dump_file(Host, Fd)}};
+handle_cast({reload_module, NewOpts, OldOpts},
+            #antispam_state{host = Host, dump_fd = Fd} = State) ->
+    RtblServices = gen_mod:get_opt(rtbl_services, NewOpts),
+    mod_antispam_rtbl:cancel_timers(RtblServices),
+    mod_antispam_rtbl:unsubscribe(RtblServices, Host),
+    mod_antispam_rtbl:request_blocked_domains(RtblServices, Host),
     State1 =
-        State#state{dump_fd = mod_antispam_dump:reload_dumping(Host, Fd, OldOpts, NewOpts)},
+        State#antispam_state{dump_fd =
+                                 mod_antispam_dump:reload_dumping(Host, Fd, OldOpts, NewOpts)},
     State2 =
         case {gen_mod:get_opt(cache_size, OldOpts), gen_mod:get_opt(cache_size, NewOpts)} of
             {OldMax, NewMax} when NewMax < OldMax ->
-                shrink_cache(State1#state{max_cache_size = NewMax});
+                shrink_cache(State1#antispam_state{max_cache_size = NewMax});
             {OldMax, NewMax} when NewMax > OldMax ->
-                State1#state{max_cache_size = NewMax};
+                State1#antispam_state{max_cache_size = NewMax};
             {_OldMax, _NewMax} ->
                 State1
         end,
-    ok = mod_antispam_rtbl:unsubscribe(OldRTBLHost, OldRTBLDomainsNode, Host),
-    {_Result, State3} = reload_files(State2#state{blocked_domains = #{}}),
-    RTBLHost = gen_mod:get_opt(rtbl_host, NewOpts),
-    RTBLDomainsNode = gen_mod:get_opt(rtbl_domains_node, NewOpts),
-    ok = mod_antispam_rtbl:request_blocked_domains(RTBLHost, RTBLDomainsNode, Host),
-    {noreply, State3#state{rtbl_host = RTBLHost, rtbl_domains_node = RTBLDomainsNode}};
-handle_cast({update_blocked_domains, NewItems},
-            #state{blocked_domains = BlockedDomains} = State) ->
-    {noreply, State#state{blocked_domains = maps:merge(BlockedDomains, NewItems)}};
+    {_Result, State3} = reload_files(update_blocked_domains_state(clean_all, State2)),
+    {noreply, State3#antispam_state{rtbl_services = RtblServices}};
+handle_cast({update_blocked_domains, RHost, Node, NewItems},
+            #antispam_state{rtbl_services = Services} = State) ->
+    NewDomains =
+        case mod_antispam_rtbl:get_service(RHost, Node, Services) of
+            error_finding_service ->
+                ?ERROR_MSG("Will not update blocked domains from unknown RTBL service (host ~p, node ~p)",
+                           [RHost, Node]),
+                #{};
+            #rtbl_service{} ->
+                NewItems
+        end,
+    {noreply, update_blocked_domains_state({add, NewDomains}, State)};
 handle_cast(Request, State) ->
     ?ERROR_MSG("Got unexpected request from: ~p", [Request]),
     {noreply, State}.
 
--spec handle_info(term(), state()) -> {noreply, state()}.
-handle_info({iq_reply, timeout, blocked_domains}, State) ->
-    ?WARNING_MSG("Fetching blocked domains failed: fetch timeout. Retrying in 60 seconds",
-                 []),
-    {noreply,
-     State#state{rtbl_retry_timer =
-                     erlang:send_after(60000, self(), request_blocked_domains)}};
-handle_info({iq_reply, #iq{type = error} = IQ, blocked_domains}, State) ->
-    ?WARNING_MSG("Fetching blocked domains failed: ~p. Retrying in 60 seconds",
-                 [xmpp:format_stanza_error(
-                      xmpp:get_error(IQ))]),
-    {noreply,
-     State#state{rtbl_retry_timer =
-                     erlang:send_after(60000, self(), request_blocked_domains)}};
-handle_info({iq_reply, IQReply, blocked_domains},
-            #state{blocked_domains = OldBlockedDomains,
-                   rtbl_host = RTBLHost,
-                   rtbl_domains_node = RTBLDomainsNode,
-                   host = Host} =
-                State) ->
-    case mod_antispam_rtbl:parse_blocked_domains(IQReply) of
-        undefined ->
-            ?WARNING_MSG("Fetching initial list failed: invalid result payload", []),
-            {noreply, State#state{rtbl_retry_timer = undefined}};
-        NewBlockedDomains ->
-            ok = mod_antispam_rtbl:subscribe(RTBLHost, RTBLDomainsNode, Host),
-            {noreply,
-             State#state{rtbl_retry_timer = undefined,
-                         rtbl_subscribed = true,
-                         blocked_domains = maps:merge(OldBlockedDomains, NewBlockedDomains)}}
-    end;
-handle_info({iq_reply, timeout, subscribe_result}, State) ->
-    ?WARNING_MSG("Subscription error: request timeout", []),
-    {noreply, State#state{rtbl_subscribed = false}};
-handle_info({iq_reply, #iq{type = error} = IQ, subscribe_result}, State) ->
-    ?WARNING_MSG("Subscription error: ~p",
-                 [xmpp:format_stanza_error(
-                      xmpp:get_error(IQ))]),
-    {noreply, State#state{rtbl_subscribed = false}};
-handle_info({iq_reply, IQReply, subscribe_result}, State) ->
-    ?DEBUG("Got subscribe result: ~p", [IQReply]),
-    {noreply, State#state{rtbl_subscribed = true}};
-handle_info({iq_reply, _IQReply, unsubscribe_result}, State) ->
-    %% FIXME: we should check it's true (of type `result`, not `error`), but at that point, what
-    %% would we do?
-    {noreply, State#state{rtbl_subscribed = false}};
+%%--------------------------------------------------------------------
+%%| gen_server: handle_info
+
+-spec handle_info(term(), antispam_state()) -> {noreply, antispam_state()}.
+handle_info({iq_reply, IQ, Atom}, State) ->
+    {noreply, mod_antispam_rtbl:handle_iq_reply(IQ, Atom, State)};
 handle_info(request_blocked_domains,
-            #state{host = Host,
-                   rtbl_host = RTBLHost,
-                   rtbl_domains_node = RTBLDomainsNode} =
-                State) ->
-    mod_antispam_rtbl:request_blocked_domains(RTBLHost, RTBLDomainsNode, Host),
+            #antispam_state{host = Host, rtbl_services = RtblServices} = State) ->
+    mod_antispam_rtbl:request_blocked_domains(RtblServices, Host),
     {noreply, State};
 handle_info(Info, State) ->
     ?ERROR_MSG("Got unexpected info: ~p", [Info]),
     {noreply, State}.
 
--spec terminate(normal | shutdown | {shutdown, term()} | term(), state()) -> ok.
+%%--------------------------------------------------------------------
+%%| gen_server: terminate
+
+-spec terminate(normal | shutdown | {shutdown, term()} | term(), antispam_state()) -> ok.
 terminate(Reason,
-          #state{host = Host,
-                 dump_fd = Fd,
-                 rtbl_host = RTBLHost,
-                 rtbl_domains_node = RTBLDomainsNode,
-                 rtbl_retry_timer = RTBLRetryTimer} =
+          #antispam_state{host = Host,
+                          dump_fd = Fd,
+                          rtbl_services = RtblServices} =
               _State) ->
     ?DEBUG("Stopping spam filter process for ~s: ~p", [Host, Reason]),
-    misc:cancel_timer(RTBLRetryTimer),
     mod_antispam_dump:terminate_dumping(Host, Fd),
     mod_antispam_files:terminate_files(Host),
     mod_antispam_filter:terminate_filtering(Host),
-    ejabberd_hooks:delete(local_send_to_resource_hook,
-                          Host,
-                          mod_antispam_rtbl,
-                          pubsub_event_handler,
-                          50),
-    mod_antispam_rtbl:unsubscribe(RTBLHost, RTBLDomainsNode, Host),
+    mod_antispam_rtbl:cancel_timers(RtblServices),
+    mod_antispam_rtbl:delete_hook(Host),
+    mod_antispam_rtbl:unsubscribe(RtblServices, Host),
     ok.
 
--spec code_change({down, term()} | term(), state(), term()) -> {ok, state()}.
-code_change(_OldVsn, #state{host = Host} = State, _Extra) ->
+%%--------------------------------------------------------------------
+%%| gen_server: code_change
+
+-spec code_change({down, term()} | term(), antispam_state(), term()) ->
+                     {ok, antispam_state()}.
+code_change(_OldVsn, #antispam_state{host = Host} = State, _Extra) ->
     ?DEBUG("Updating spam filter process for ~s", [Host]),
     {ok, State}.
 
 %%--------------------------------------------------------------------
-%%| Internal functions
+%%| Filter
 
--spec filter_jid(ljid(), jid_set(), state()) -> {ham | spam, state()}.
-filter_jid(From, Set, #state{host = Host} = State) ->
+-spec filter_from(ljid(), jid_set(), antispam_state()) -> {ham | spam, antispam_state()}.
+filter_from(From, Set, State) ->
     case sets:is_element(From, Set) of
         true ->
-            ?DEBUG("Spam JID found: ~s", [jid:encode(From)]),
-            ejabberd_hooks:run(spam_found, Host, [{jid, From}]),
             {spam, State};
         false ->
             case cache_lookup(From, State) of
                 {true, State1} ->
-                    ?DEBUG("Spam JID found: ~s", [jid:encode(From)]),
-                    ejabberd_hooks:run(spam_found, Host, [{jid, From}]),
                     {spam, State1};
                 {false, State1} ->
-                    ?DEBUG("JID not listed: ~s", [jid:encode(From)]),
                     {ham, State1}
             end
     end.
@@ -467,48 +457,52 @@ filter_jid(From, Set, #state{host = Host} = State) ->
 -spec filter_body({urls, [url()]} | {jids, [ljid()]} | none,
                   url_set() | jid_set(),
                   jid(),
-                  state()) ->
-                     {ham | spam, state()}.
-filter_body({_, Addrs}, Set, From, #state{host = Host} = State) ->
+                  antispam_state()) ->
+                     {ham | spam, antispam_state()}.
+filter_body({_, Addrs}, Set, From, State) ->
     case lists:any(fun(Addr) -> sets:is_element(Addr, Set) end, Addrs) of
         true ->
-            ?DEBUG("Spam addresses found: ~p", [Addrs]),
-            ejabberd_hooks:run(spam_found, Host, [{body, Addrs}]),
             {spam, cache_insert(From, State)};
         false ->
-            ?DEBUG("Addresses not listed: ~p", [Addrs]),
             {ham, State}
     end;
 filter_body(none, _Set, _From, State) ->
     {ham, State}.
 
--spec reload_files(state()) -> {ok | {error, binary()}, state()}.
-reload_files(#state{host = Host, blocked_domains = BlockedDomains} = State) ->
+%%--------------------------------------------------------------------
+%%| Text files
+
+-spec reload_files(antispam_state()) -> {ok | {error, binary()}, antispam_state()}.
+reload_files(#antispam_state{host = Host} = State) ->
     case read_files(Host) of
         #{jid := JIDsSet,
           url := URLsSet,
           domains := SpamDomainsSet,
           whitelist_domains := WhitelistDomains} ->
-            case sets_equal(JIDsSet, State#state.jid_set) of
+            case sets_equal(JIDsSet, State#antispam_state.jid_set) of
                 true ->
                     ?INFO_MSG("Reloaded spam JIDs for ~s (unchanged)", [Host]);
                 false ->
                     ?INFO_MSG("Reloaded spam JIDs for ~s (changed)", [Host])
             end,
-            case sets_equal(URLsSet, State#state.url_set) of
+            case sets_equal(URLsSet, State#antispam_state.url_set) of
                 true ->
                     ?INFO_MSG("Reloaded spam URLs for ~s (unchanged)", [Host]);
                 false ->
                     ?INFO_MSG("Reloaded spam URLs for ~s (changed)", [Host])
             end,
+            State2 = update_blocked_domains_state({add, set_to_map(SpamDomainsSet)}, State),
             {ok,
-             State#state{jid_set = JIDsSet,
-                         url_set = URLsSet,
-                         blocked_domains = maps:merge(BlockedDomains, set_to_map(SpamDomainsSet)),
-                         whitelist_domains = set_to_map(WhitelistDomains, false)}};
+             State2#antispam_state{jid_set = JIDsSet,
+                                   url_set = URLsSet,
+                                   whitelist_domains = set_to_map(WhitelistDomains, false)}};
         {config_error, ErrorText} ->
             {{error, ErrorText}, State}
     end.
+
+-spec sets_equal(sets:set(), sets:set()) -> boolean().
+sets_equal(A, B) ->
+    sets:is_subset(A, B) andalso sets:is_subset(B, A).
 
 set_to_map(Set) ->
     set_to_map(Set, true).
@@ -529,17 +523,27 @@ read_files(Host) ->
           whitelist_domains => gen_mod:get_module_opt(Host, ?MODULE, whitelist_domains_file)},
     ejabberd_hooks:run_fold(antispam_get_lists, Host, AccInitial, [Files]).
 
+%%--------------------------------------------------------------------
+%%| Auxiliary functions
+
+update_blocked_domains_state(Operation,
+                             #antispam_state{host = Host, blocked_domains = BlockedDomains} =
+                                 State) ->
+    NewDomains =
+        case Operation of
+            clean_all ->
+                #{};
+            {add, AddDomains} ->
+                mod_antispam_filter:notify_rooms(Host, AddDomains),
+                maps:merge(BlockedDomains, AddDomains);
+            {remove, RemoveDomain} ->
+                maps:remove(RemoveDomain, BlockedDomains)
+        end,
+    State#antispam_state{blocked_domains = NewDomains}.
+
 -spec get_proc_name(binary()) -> atom().
 get_proc_name(Host) ->
     gen_mod:get_module_proc(Host, ?MODULE).
-
--spec get_spam_filter_hosts() -> [binary()].
-get_spam_filter_hosts() ->
-    [H || H <- ejabberd_option:hosts(), gen_mod:is_loaded(H, ?MODULE)].
-
--spec sets_equal(sets:set(), sets:set()) -> boolean().
-sets_equal(A, B) ->
-    sets:is_subset(A, B) andalso sets:is_subset(B, A).
 
 -spec format(io:format(), [term()]) -> binary().
 format(Format, Data) ->
@@ -548,58 +552,58 @@ format(Format, Data) ->
 %%--------------------------------------------------------------------
 %%| Caching
 
--spec cache_insert(ljid(), state()) -> state().
-cache_insert(_LJID, #state{max_cache_size = 0} = State) ->
+-spec cache_insert(ljid(), antispam_state()) -> antispam_state().
+cache_insert(_LJID, #antispam_state{max_cache_size = 0} = State) ->
     State;
-cache_insert(LJID, #state{jid_cache = Cache, max_cache_size = MaxSize} = State)
+cache_insert(LJID, #antispam_state{jid_cache = Cache, max_cache_size = MaxSize} = State)
     when MaxSize /= unlimited, map_size(Cache) >= MaxSize ->
     cache_insert(LJID, shrink_cache(State));
-cache_insert(LJID, #state{jid_cache = Cache} = State) ->
+cache_insert(LJID, #antispam_state{jid_cache = Cache} = State) ->
     ?INFO_MSG("Caching spam JID: ~s", [jid:encode(LJID)]),
     Cache1 = Cache#{LJID => erlang:monotonic_time(second)},
-    State#state{jid_cache = Cache1}.
+    State#antispam_state{jid_cache = Cache1}.
 
--spec cache_lookup(ljid(), state()) -> {boolean(), state()}.
-cache_lookup(LJID, #state{jid_cache = Cache} = State) ->
+-spec cache_lookup(ljid(), antispam_state()) -> {boolean(), antispam_state()}.
+cache_lookup(LJID, #antispam_state{jid_cache = Cache} = State) ->
     case Cache of
         #{LJID := _Timestamp} ->
             Cache1 = Cache#{LJID => erlang:monotonic_time(second)},
-            State1 = State#state{jid_cache = Cache1},
+            State1 = State#antispam_state{jid_cache = Cache1},
             {true, State1};
         #{} ->
             {false, State}
     end.
 
--spec shrink_cache(state()) -> state().
-shrink_cache(#state{jid_cache = Cache, max_cache_size = MaxSize} = State) ->
+-spec shrink_cache(antispam_state()) -> antispam_state().
+shrink_cache(#antispam_state{jid_cache = Cache, max_cache_size = MaxSize} = State) ->
     ShrinkedSize = round(MaxSize / 2),
     N = map_size(Cache) - ShrinkedSize,
     L = lists:keysort(2, maps:to_list(Cache)),
     Cache1 =
         maps:from_list(
             lists:nthtail(N, L)),
-    State#state{jid_cache = Cache1}.
+    State#antispam_state{jid_cache = Cache1}.
 
--spec expire_cache(integer(), state()) -> {{ok, binary()}, state()}.
-expire_cache(Age, #state{jid_cache = Cache} = State) ->
+-spec expire_cache(integer(), antispam_state()) -> {{ok, binary()}, antispam_state()}.
+expire_cache(Age, #antispam_state{jid_cache = Cache} = State) ->
     Threshold = erlang:monotonic_time(second) - Age,
     Cache1 = maps:filter(fun(_, TS) -> TS >= Threshold end, Cache),
     NumExp = map_size(Cache) - map_size(Cache1),
     Txt = format("Expired ~B cache entries", [NumExp]),
-    {{ok, Txt}, State#state{jid_cache = Cache1}}.
+    {{ok, Txt}, State#antispam_state{jid_cache = Cache1}}.
 
--spec add_to_cache(ljid(), state()) -> {{ok, binary()}, state()}.
+-spec add_to_cache(ljid(), antispam_state()) -> {{ok, binary()}, antispam_state()}.
 add_to_cache(LJID, State) ->
     State1 = cache_insert(LJID, State),
     Txt = format("~s added to cache", [jid:encode(LJID)]),
     {{ok, Txt}, State1}.
 
--spec drop_from_cache(ljid(), state()) -> {{ok, binary()}, state()}.
-drop_from_cache(LJID, #state{jid_cache = Cache} = State) ->
+-spec drop_from_cache(ljid(), antispam_state()) -> {{ok, binary()}, antispam_state()}.
+drop_from_cache(LJID, #antispam_state{jid_cache = Cache} = State) ->
     Cache1 = maps:remove(LJID, Cache),
     if map_size(Cache1) < map_size(Cache) ->
            Txt = format("~s removed from cache", [jid:encode(LJID)]),
-           {{ok, Txt}, State#state{jid_cache = Cache1}};
+           {{ok, Txt}, State#antispam_state{jid_cache = Cache1}};
        true ->
            Txt = format("~s wasn't cached", [jid:encode(LJID)]),
            {{ok, Txt}, State}
@@ -688,6 +692,10 @@ for_all_hosts(F, A) ->
         error:{badmatch, {error, _Reason} = Error} ->
             Error
     end.
+
+-spec get_spam_filter_hosts() -> [binary()].
+get_spam_filter_hosts() ->
+    [H || H <- ejabberd_option:hosts(), gen_mod:is_loaded(H, ?MODULE)].
 
 try_call_by_host(Host, Call) ->
     LServer = jid:nameprep(Host),

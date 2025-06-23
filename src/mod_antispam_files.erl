@@ -37,12 +37,12 @@
 % Hooks
 -export([get_files_lists/2]).
 
+-include_lib("xmpp/include/xmpp.hrl").
+
 -include("ejabberd_commands.hrl").
 -include("logger.hrl").
 -include("mod_antispam.hrl").
 -include("translate.hrl").
-
--include_lib("xmpp/include/xmpp.hrl").
 
 -type files_map() :: #{atom() => filename()}.
 -type lists_map() ::
