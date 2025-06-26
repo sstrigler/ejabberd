@@ -111,13 +111,15 @@ mod_opt_type(access_spam) ->
 mod_opt_type(cache_size) ->
     econf:pos_int(unlimited);
 mod_opt_type(rtbl_services) ->
-    econf:list(
-        econf:and_then(
-            econf:options(#{host => econf:binary(), node => econf:binary()}),
-            fun(Opts) ->
-               #rtbl_service{host = proplists:get_value(host, Opts, <<>>),
-                             node = proplists:get_value(node, Opts, <<>>)}
-            end));
+    econf:either(
+        econf:bool(),
+        econf:list(
+            econf:and_then(
+                econf:options(#{host => econf:binary(), node => econf:binary()}),
+                fun(Opts) ->
+                   #rtbl_service{host = proplists:get_value(host, Opts, <<>>),
+                                 node = proplists:get_value(node, Opts, <<>>)}
+                end)));
 mod_opt_type(spam_domains_file) ->
     econf:either(
         econf:enum([none]), econf:file());
@@ -134,14 +136,11 @@ mod_opt_type(whitelist_domains_file) ->
     econf:either(
         econf:enum([none]), econf:file()).
 
--spec mod_options(binary()) -> [{rtbl_services, [tuple()]} | {atom(), any()}].
+-spec mod_options(binary()) -> [{rtbl_services, boolean() | [tuple()]} | {atom(), any()}].
 mod_options(_Host) ->
-    DefaultRtblServices =
-        [#rtbl_service{host = <<"xmppbl.org">>, node = <<"muc_bans_sha256">>},
-         #rtbl_service{host = <<"xmppbl.org">>, node = <<"spam_source_domains">>}],
     [{access_spam, none},
      {cache_size, ?DEFAULT_CACHE_SIZE},
-     {rtbl_services, DefaultRtblServices},
+     {rtbl_services, false},
      {spam_domains_file, none},
      {spam_dump_file, false},
      {spam_jids_file, none},
@@ -151,8 +150,9 @@ mod_options(_Host) ->
 mod_doc() ->
     #{desc =>
           ?T("Filter spam messages and subscription requests received from "
-             "remote servers based on Real-Time Block Lists (RTBL), lists of known "
-             "spammer JIDs and/or URLs mentioned in spam messages. "
+             "remote servers based on "
+             "https://xmppbl.org/[Real-Time Block Lists (RTBL)], "
+             "lists of known spammer JIDs and/or URLs mentioned in spam messages. "
              "Traffic classified as spam is rejected with an error "
              "(and an '[info]' message is logged) unless the sender "
              "is subscribed to the recipient's presence."),
@@ -177,7 +177,7 @@ mod_doc() ->
                      " and that the caches aren't distributed across cluster nodes. "
                      "The default value is '10000'.")}},
            {rtbl_services,
-            #{value => ?T("[Service, ...]"),
+            #{value => ?T("false | true | [Service, ...]"),
               example =>
                   ["rtbl_services:",
                    "  -",
@@ -190,10 +190,12 @@ mod_doc() ->
                    "    host: pubsub.server2.localhost",
                    "    node: spam2_source_domains"],
               desc =>
-                  ?T("List of RTBL services to subscribe and obtain list of domains to block. "
-                     "The default value is to use both PubSub nodes provided "
-                     "by https://xmppbl.org/[xmppbl.org]. "
-                     "Each 'Service' element in the list is constructed using the following options: ")},
+                  ?T("List of RTBL services to query for domains to block. "
+                     "If set to 'false', it doesn't query RTBL services, which is the default. "
+                     "If set to 'true', it queries RTBL services provided by "
+                     "https://xmppbl.org/[xmppbl.org]. "
+                     "If set to a list of services, each service in the list "
+                     "is constructed using the following options: ")},
             [{host,
               #{value => "string()", desc => ?T("Remote host with a PubSub service to query.")}},
              {node, #{value => "string()", desc => ?T("PubSub node to query.")}}]},
@@ -263,7 +265,7 @@ mod_doc() ->
 -spec init(list()) -> {ok, antispam_state()} | {stop, term()}.
 init([Host, Opts]) ->
     process_flag(trap_exit, true),
-    RtblServices = gen_mod:get_opt(rtbl_services, Opts),
+    RtblServices = get_rtbl_services_option(Opts),
     mod_antispam_files:init_files(Host),
     mod_antispam_filter:init_filtering(Host),
     mod_antispam_rtbl:add_hook(Host),
@@ -362,7 +364,7 @@ handle_cast(reopen_log, #antispam_state{host = Host, dump_fd = Fd} = State) ->
     {noreply, State#antispam_state{dump_fd = mod_antispam_dump:reopen_dump_file(Host, Fd)}};
 handle_cast({reload_module, NewOpts, OldOpts},
             #antispam_state{host = Host, dump_fd = Fd} = State) ->
-    RtblServices = gen_mod:get_opt(rtbl_services, NewOpts),
+    RtblServices = get_rtbl_services_option(NewOpts),
     mod_antispam_rtbl:cancel_timers(RtblServices),
     mod_antispam_rtbl:unsubscribe(RtblServices, Host),
     mod_antispam_rtbl:request_blocked_domains(RtblServices, Host),
@@ -540,6 +542,17 @@ update_blocked_domains_state(Operation,
                 maps:remove(RemoveDomain, BlockedDomains)
         end,
     State#antispam_state{blocked_domains = NewDomains}.
+
+get_rtbl_services_option(Opts) ->
+    case gen_mod:get_opt(rtbl_services, Opts) of
+        false ->
+            [];
+        true ->
+            [#rtbl_service{host = <<"xmppbl.org">>, node = <<"muc_bans_sha256">>},
+             #rtbl_service{host = <<"xmppbl.org">>, node = <<"spam_source_domains">>}];
+        Services when is_list(Services) ->
+            Services
+    end.
 
 -spec get_proc_name(binary()) -> atom().
 get_proc_name(Host) ->
