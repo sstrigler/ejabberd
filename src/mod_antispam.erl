@@ -35,6 +35,7 @@
 
 %% gen_mod callbacks.
 -export([start/2,
+	 prep_stop/1,
 	 stop/1,
 	 reload/3,
 	 depends/2,
@@ -84,6 +85,13 @@ start(Host, Opts) ->
             ok
     end,
     gen_mod:start_child(?MODULE, Host, Opts).
+
+-spec prep_stop(binary()) -> ok | {error, any()}.
+prep_stop(Host) ->
+    case try_call_by_host(Host, prepare_stop) of
+        ready_to_stop ->
+            ok
+    end.
 
 -spec stop(binary()) -> ok | {error, any()}.
 stop(Host) ->
@@ -349,6 +357,11 @@ handle_call({is_blocked_domain, Domain},
                 true
         end,
     {reply, Result, State};
+handle_call(prepare_stop,
+            _From,
+            #antispam_state{host = Host, rtbl_services = RtblServices} = State) ->
+    mod_antispam_rtbl:unsubscribe(RtblServices, Host),
+    {reply, ready_to_stop, State};
 handle_call(Request, From, State) ->
     ?ERROR_MSG("Got unexpected request from ~p: ~p", [From, Request]),
     {noreply, State}.
@@ -427,7 +440,6 @@ terminate(Reason,
     mod_antispam_filter:terminate_filtering(Host),
     mod_antispam_rtbl:cancel_timers(RtblServices),
     mod_antispam_rtbl:delete_hook(Host),
-    mod_antispam_rtbl:unsubscribe(RtblServices, Host),
     ok.
 
 %%--------------------------------------------------------------------
