@@ -26,6 +26,7 @@
     name = <<>>                            :: binary() | '_',
     subscription = none                    :: subscription() | '_',
     ask = none                             :: ask() | '_',
+    approved = false                       :: boolean() | '_',
     groups = []                            :: [binary()] | '_',
     askmessage = <<"">>                    :: binary() | '_',
     xs = []                                :: [fxml:xmlel()] | '_'

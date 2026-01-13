@@ -51,7 +51,7 @@ stop(_TestCase, Config) ->
 %%%===================================================================
 single_cases() ->
     {roster_single, [sequence],
-     [single_test(feature_enabled),
+     [single_test(features_enabled),
       single_test(iq_set_many_items),
       single_test(iq_set_duplicated_groups),
       single_test(iq_get_item),
@@ -60,9 +60,10 @@ single_cases() ->
       single_test(set_item),
       single_test(version)]}.
 
-feature_enabled(Config) ->
-    ct:comment("Checking if roster versioning stream feature is set"),
+features_enabled(Config) ->
+    ct:comment("Checking if roster stream feature (versioning and pre-approval) is set"),
     true = ?config(rosterver, Config),
+    true = ?config(pre_approval, Config),
     disconnect(Config).
 
 set_item(Config) ->
