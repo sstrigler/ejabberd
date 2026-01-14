@@ -1245,7 +1245,7 @@ export(LServer) ->
 import_info() ->
     [{<<"roster_version">>, 2},
      {<<"rostergroups">>, 3},
-     {<<"rosterusers">>, 10}].
+     {<<"rosterusers">>, 11}].
 
 import_start(LServer, DBType) ->
     Mod = gen_mod:db_mod(DBType, ?MODULE),
