@@ -162,6 +162,7 @@ subscribe_slave(Config) ->
 
 process_subscriptions_master(Config, Actions) ->
     EnumeratedActions = lists:zip(lists:seq(1, length(Actions)), Actions),
+    ct:pal("actions: ~p", [EnumeratedActions]),
     self_presence(Config, available),
     Peer = ?config(peer, Config),
     lists:foldl(
